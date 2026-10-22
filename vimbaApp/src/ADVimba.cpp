@@ -47,6 +47,8 @@ static const char *driverName = "ADVimba";
 #define CALLBACK_MESSAGE_QUEUE_SIZE 10
 
 #define NUM_VIMBA_BUFFERS 10
+#define FRAME_WAIT_TIMEOUT 0.1
+#define FRAME_WAIT_DIAGNOSTIC_TIMEOUTS 50
 
 typedef enum {
     VMBPixelConvertNone,
@@ -344,17 +346,20 @@ void ADVimba::connectionCallback(UpdateTriggerType reason)
 void ADVimba::imageGrabTask()
 {
     int acquire;
+    int arrayCounter;
+    int detectorStatus;
+    int frameWaitTimeouts = 0;
+    int imageMode;
     int numImages;
     int numImagesCounter;
-    int imageMode;
     static const char *functionName = "imageGrabTask";
 
     lock();
 
     while (1) {
-        // Is acquisition active? 
+        // Is acquisition active?
         getIntegerParam(ADAcquire, &acquire);
-        // If we are not acquiring then wait for a semaphore that is given when acquisition is started 
+        // If we are not acquiring then wait for a semaphore that is given when acquisition is started
         if (!acquire) {
             setIntegerParam(ADStatus, ADStatusIdle);
             callParamCallbacks();
@@ -362,14 +367,15 @@ void ADVimba::imageGrabTask()
             // Wait for a signal that tells this thread that the transmission
             // has started and we can start asking for image buffers...
             asynPrint(pasynUserSelf, ASYN_TRACE_FLOW,
-                "%s::%s waiting for acquire to start\n", 
+                "%s::%s waiting for acquire to start\n",
                 driverName, functionName);
             // Release the lock while we wait for an event that says acquire has started, then lock again
             unlock();
             epicsEventWait(startEventId_);
             lock();
+            frameWaitTimeouts = 0;
             asynPrint(pasynUserSelf, ASYN_TRACE_FLOW,
-                "%s::%s started!\n", 
+                "%s::%s started\n",
                 driverName, functionName);
             setIntegerParam(ADNumImagesCounter, 0);
             setIntegerParam(ADAcquire, 1);
@@ -382,17 +388,47 @@ void ADVimba::imageGrabTask()
 
         // Wait for event saying image has been collected
         unlock();
-        epicsEventWaitStatus waitStatus = epicsEventWaitWithTimeout(newFrameEventId_, 0.1);
+        epicsEventWaitStatus waitStatus = epicsEventWaitWithTimeout(newFrameEventId_, FRAME_WAIT_TIMEOUT);
         lock();
         if (waitStatus == epicsEventWaitOK) {
+            int stopAcquisition;
+            frameWaitTimeouts = 0;
             getIntegerParam(ADNumImages, &numImages);
             getIntegerParam(ADNumImagesCounter, &numImagesCounter);
             getIntegerParam(ADImageMode, &imageMode);
             // See if acquisition is done if we are in single or multiple mode
-            if ((imageMode == ADImageSingle) || ((imageMode == ADImageMultiple) && (numImagesCounter >= numImages))) {
+            stopAcquisition = (imageMode == ADImageSingle) ||
+                              ((imageMode == ADImageMultiple) && (numImagesCounter >= numImages));
+            if (stopAcquisition) {
+                asynPrint(pasynUserSelf, ASYN_TRACE_FLOW,
+                    "%s::%s stopping after frame event imageMode=%d "
+                    "ADNumImagesCounter=%d ADNumImages=%d\n",
+                    driverName, functionName, imageMode, numImagesCounter, numImages);
                 setIntegerParam(ADStatus, ADStatusIdle);
                 stopCapture();
             }
+        } else if (waitStatus == epicsEventWaitTimeout) {
+            frameWaitTimeouts++;
+            if (frameWaitTimeouts >= FRAME_WAIT_DIAGNOSTIC_TIMEOUTS) {
+                getIntegerParam(ADAcquire, &acquire);
+                getIntegerParam(ADStatus, &detectorStatus);
+                getIntegerParam(ADImageMode, &imageMode);
+                getIntegerParam(ADNumImages, &numImages);
+                getIntegerParam(ADNumImagesCounter, &numImagesCounter);
+                getIntegerParam(NDArrayCounter, &arrayCounter);
+                asynPrint(pasynUserSelf, ASYN_TRACE_FLOW,
+                    "%s::%s no frame callback for %.1f seconds acquiring_=%d ADAcquire=%d "
+                    "ADStatus=%d imageMode=%d ADNumImagesCounter=%d ADNumImages=%d NDArrayCounter=%d\n",
+                    driverName, functionName,
+                    FRAME_WAIT_TIMEOUT * FRAME_WAIT_DIAGNOSTIC_TIMEOUTS,
+                    acquiring_, acquire, detectorStatus, imageMode, numImagesCounter,
+                    numImages, arrayCounter);
+                frameWaitTimeouts = 0;
+            }
+        } else {
+            asynPrint(pasynUserSelf, ASYN_TRACE_FLOW,
+                "%s::%s epicsEventWaitWithTimeout returned %d\n",
+                driverName, functionName, waitStatus);
         }
         callParamCallbacks();
     }
@@ -401,13 +437,30 @@ void ADVimba::imageGrabTask()
 asynStatus ADVimba::processFrame(FramePtr pFrame)
 {
     asynStatus status = asynSuccess;
+    asynStatus imageCounterSetStatus = asynSuccess;
+    asynStatus numImagesCounterSetStatus = asynSuccess;
+    asynStatus paramCallbackStatus;
     VmbError_t vmbStatus;
+    VmbErrorType frameIdStatus;
+    VmbErrorType queueStatus;
+    VmbFrameStatusType frameStatus = VmbFrameStatusIncomplete;
+    VmbUint64_t frameId = 0;
     VmbUint32_t nRows, nCols;
     NDDataType_t dataType;
     NDColorMode_t colorMode;
     VmbPixelFormatType pixelFormat;
+    int acquire;
+    int arrayCallbacks;
     int convertPixelFormat;
+    int counterUpdateAttempted = 0;
+    int detectorStatus;
+    int imageCounter;
+    int imageMode;
     int numColors = 1;
+    int numImages;
+    int numImagesCounter;
+    int previousImageCounter = -1;
+    int previousNumImagesCounter = -1;
     size_t dims[3];
     int pixelSize;
     size_t dataSize;
@@ -416,14 +469,11 @@ asynStatus ADVimba::processFrame(FramePtr pFrame)
     int timeStampMode;
     VmbUchar_t *pConvertBuffer = NULL;
     VmbUchar_t *pData = NULL;
-    int imageCounter;
-    int numImagesCounter;
-    int arrayCallbacks;
     NDArray *pRaw = NULL;
     static const char *functionName = "processFrame";
 
     lock();
-    VmbFrameStatusType frameStatus = VmbFrameStatusIncomplete;
+    frameIdStatus = pFrame->GetFrameID(frameId);
     vmbStatus = pFrame->GetReceiveStatus(frameStatus);
     if (VmbErrorSuccess != vmbStatus || VmbFrameStatusComplete != frameStatus) {
         asynPrint(pasynUserSelf, ASYN_TRACE_ERROR,
@@ -621,10 +671,13 @@ asynStatus ADVimba::processFrame(FramePtr pFrame)
     pRaw->pAttributeList->add("ColorMode", "Color mode", NDAttrInt32, &colorMode);
     getIntegerParam(NDArrayCounter, &imageCounter);
     getIntegerParam(ADNumImagesCounter, &numImagesCounter);
+    previousImageCounter = imageCounter;
+    previousNumImagesCounter = numImagesCounter;
     imageCounter++;
     numImagesCounter++;
-    setIntegerParam(NDArrayCounter, imageCounter);
-    setIntegerParam(ADNumImagesCounter, numImagesCounter);
+    counterUpdateAttempted = 1;
+    imageCounterSetStatus = setIntegerParam(NDArrayCounter, imageCounter);
+    numImagesCounterSetStatus = setIntegerParam(ADNumImagesCounter, numImagesCounter);
     getIntegerParam(NDArrayCallbacks, &arrayCallbacks);
     if (arrayCallbacks) {
         // Call the NDArray callback
@@ -643,12 +696,41 @@ asynStatus ADVimba::processFrame(FramePtr pFrame)
          if (pFeature) pFeature->read(0, true);
     }
 
-    callParamCallbacks();
+    paramCallbackStatus = callParamCallbacks();
     // Release the NDArray buffer now that we are done with it.
     // After the callback just above we don't need it anymore
     if (pRaw) pRaw->release();
     if (pConvertBuffer) free(pConvertBuffer);
-    pCamera_->QueueFrame(pFrame);
+    queueStatus = pCamera_->QueueFrame(pFrame);
+    getIntegerParam(ADAcquire, &acquire);
+    getIntegerParam(ADStatus, &detectorStatus);
+    getIntegerParam(ADImageMode, &imageMode);
+    getIntegerParam(ADNumImages, &numImages);
+    getIntegerParam(ADNumImagesCounter, &numImagesCounter);
+    getIntegerParam(NDArrayCounter, &imageCounter);
+    getIntegerParam(NDArrayCallbacks, &arrayCallbacks);
+    if ((status != asynSuccess) ||
+        (frameIdStatus != VmbErrorSuccess) ||
+        (queueStatus != VmbErrorSuccess) ||
+        (paramCallbackStatus != asynSuccess) ||
+        (counterUpdateAttempted &&
+         ((imageCounterSetStatus != asynSuccess) ||
+          (numImagesCounterSetStatus != asynSuccess) ||
+          (numImagesCounter == 1) ||
+          ((imageMode != ADImageContinuous) && (numImagesCounter >= numImages))))) {
+        asynPrint(pasynUserSelf, ASYN_TRACE_FLOW,
+            "%s::%s frame diagnostic frameId=%llu frameIdStatus=%d GetReceiveStatus=%d "
+            "frameStatus=%d processStatus=%d counterUpdateAttempted=%d "
+            "NDArrayCounter=%d->%d setStatus=%d ADNumImagesCounter=%d->%d/%d setStatus=%d "
+            "arrayCallbacks=%d paramCallbacksStatus=%d QueueFrameStatus=%d "
+            "acquiring_=%d ADAcquire=%d ADStatus=%d imageMode=%d\n",
+            driverName, functionName, (unsigned long long)frameId, frameIdStatus,
+            vmbStatus, frameStatus, status, counterUpdateAttempted,
+            previousImageCounter, imageCounter, imageCounterSetStatus,
+            previousNumImagesCounter, numImagesCounter, numImages,
+            numImagesCounterSetStatus, arrayCallbacks, paramCallbackStatus,
+            queueStatus, acquiring_, acquire, detectorStatus, imageMode);
+    }
     epicsEventSignal(newFrameEventId_);
     unlock();
     return status;
@@ -670,15 +752,34 @@ asynStatus ADVimba::readEnum(asynUser *pasynUser, char *strings[], int values[],
 
 asynStatus ADVimba::startCapture()
 {
-    //static const char *functionName = "startCapture";
+    int imageMode;
+    int numImages;
+    int arrayCounter;
+    asynStatus counterStatus;
+    VmbErrorType vmbStatus;
+    static const char *functionName = "startCapture";
 
     // If we are already acquiring return immediately
-    if (acquiring_) return asynSuccess;
+    if (acquiring_) {
+        asynPrint(pasynUserSelf, ASYN_TRACE_FLOW,
+            "%s::%s ignored because acquisition is already active\n",
+            driverName, functionName);
+        return asynSuccess;
+    }
 
     // Start the camera transmission...
-    setIntegerParam(ADNumImagesCounter, 0);
+    counterStatus = setIntegerParam(ADNumImagesCounter, 0);
+    getIntegerParam(ADImageMode, &imageMode);
+    getIntegerParam(ADNumImages, &numImages);
+    getIntegerParam(NDArrayCounter, &arrayCounter);
     setShutter(1);
-    pCamera_->StartContinuousImageAcquisition(NUM_VIMBA_BUFFERS, IFrameObserverPtr(new ADVimbaFrameObserver(pCamera_, this)));
+    vmbStatus = pCamera_->StartContinuousImageAcquisition(
+        NUM_VIMBA_BUFFERS, IFrameObserverPtr(new ADVimbaFrameObserver(pCamera_, this)));
+    asynPrint(pasynUserSelf, ASYN_TRACE_FLOW,
+        "%s::%s StartContinuousImageAcquisition returned %d buffers=%d imageMode=%d "
+        "ADNumImages=%d ADNumImagesCounterSetStatus=%d NDArrayCounter=%d\n",
+        driverName, functionName, vmbStatus, NUM_VIMBA_BUFFERS, imageMode,
+        numImages, counterStatus, arrayCounter);
     acquiring_ = true;
     epicsEventSignal(startEventId_);
     return asynSuccess;
@@ -687,8 +788,13 @@ asynStatus ADVimba::startCapture()
 
 asynStatus ADVimba::stopCapture()
 {
+    int arrayCounter;
+    int imageMode;
+    int numImages;
+    int numImagesCounter;
     int status;
-    //static const char *functionName = "stopCapture";
+    VmbErrorType vmbStatus;
+    static const char *functionName = "stopCapture";
 
     setIntegerParam(ADAcquire, 0);
     setShutter(0);
@@ -703,10 +809,19 @@ asynStatus ADVimba::stopCapture()
     // There seems to be a deadlock with a mutex in the Vimba library if StopContinuousImageAcquisition is
     // called when the FrameObserver callback is running, because it takes the locks in the opposite order.
     // Release the driver lock here.
-    unlock(); 
-    pCamera_->StopContinuousImageAcquisition();
+    unlock();
+    vmbStatus = pCamera_->StopContinuousImageAcquisition();
     lock();
     acquiring_ = false;
+    getIntegerParam(ADImageMode, &imageMode);
+    getIntegerParam(ADNumImages, &numImages);
+    getIntegerParam(ADNumImagesCounter, &numImagesCounter);
+    getIntegerParam(NDArrayCounter, &arrayCounter);
+    asynPrint(pasynUserSelf, ASYN_TRACE_FLOW,
+        "%s::%s StopContinuousImageAcquisition returned %d imageMode=%d "
+        "ADNumImagesCounter=%d ADNumImages=%d NDArrayCounter=%d\n",
+        driverName, functionName, vmbStatus, imageMode, numImagesCounter,
+        numImages, arrayCounter);
     return asynSuccess;
 }
 
